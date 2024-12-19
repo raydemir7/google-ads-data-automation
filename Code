@@ -40,7 +40,7 @@ def get_google_ads_client():
 
 def google_ads_script():
     # Get the last written date from Google Sheets
-    last_written_date = get_last_written_date("Curist_Google_NOT_amz")
+    last_written_date = get_last_written_date("xxx")
     
     if last_written_date:
         # No need to call .date() on last_written_date, it's already a date object
@@ -59,7 +59,7 @@ def google_ads_script():
 
         if daily_data:
             # Write the aggregated data to Google Sheets
-            write_google_ads_data_to_gs(daily_data, "Curist_Google_NOT_amz")
+            write_google_ads_data_to_gs(daily_data, "xxx")
     except Exception as e:
         logger.error(f"Error encountered for {start_date}: {str(e)}")
 
@@ -161,12 +161,12 @@ def fetch_google_ads_data(customer_id, start_date, end_date, retries=0):
             logger.error(f"Error encountered: {str(e)}")
             return {}
 
-def write_google_ads_data_to_gs(aggregated_data, sheet_name: str = "Curist_Google_NOT_amz"):
+def write_google_ads_data_to_gs(aggregated_data, sheet_name: str = "xxx"):
     HEADER = ["Date", "Cost (USD)", "Revenue (USD)", "Clicks", "Purchases", "CTR (%)", "CPC (USD)", "ROAS"]
 
     try:
         gc = authenticate_gsheets()
-        sh = gc.open("Curist // Global ROAS")
+        sh = gc.open("xxx")
         worksheet = sh.worksheet(sheet_name)
 
         # Fetch existing data to determine the current state of the sheet
@@ -229,10 +229,10 @@ def write_google_ads_data_to_gs(aggregated_data, sheet_name: str = "Curist_Googl
 
 
 # Get the last date written to Google Sheets
-def get_last_written_date(sheet_name: str = "Curist_Google_NOT_amz"):
+def get_last_written_date(sheet_name: str = "xxx"):
     try:
         gc = authenticate_gsheets()
-        sh = gc.open("Curist // Global ROAS")
+        sh = gc.open("xxx")
         worksheet = sh.worksheet(sheet_name)
         data = worksheet.get_all_values()
         
