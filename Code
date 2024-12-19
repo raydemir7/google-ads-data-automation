@@ -1,0 +1,253 @@
+import time
+from datetime import datetime, timedelta
+import gspread
+from google.ads.googleads.client import GoogleAdsClient
+import functions_framework
+import os
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Environment variables for Google Ads credentials
+GOOGLE_ADS_DEVELOPER_TOKEN = os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN')
+GOOGLE_ADS_CLIENT_ID = os.getenv('GOOGLE_ADS_CLIENT_ID')
+GOOGLE_ADS_CLIENT_SECRET = os.getenv('GOOGLE_ADS_CLIENT_SECRET')
+GOOGLE_ADS_REFRESH_TOKEN = os.getenv('GOOGLE_ADS_REFRESH_TOKEN')
+GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID')
+GOOGLE_ADS_CUSTOMER_ID = os.getenv('GOOGLE_ADS_CUSTOMER_ID')
+
+# Define the maximum retries for handling rate limits
+MAX_RETRIES = 5
+RETRY_BACKOFF_FACTOR = 2  # Exponential backoff for retry delays
+
+# Google Sheets authentication
+def authenticate_gsheets():
+    return gspread.service_account(filename='service_account.json')
+
+# Initialize the Google Ads client
+def get_google_ads_client():
+    credentials = {
+        "developer_token": GOOGLE_ADS_DEVELOPER_TOKEN,
+        "client_id": GOOGLE_ADS_CLIENT_ID,
+        "client_secret": GOOGLE_ADS_CLIENT_SECRET,
+        "refresh_token": GOOGLE_ADS_REFRESH_TOKEN,
+        "login_customer_id": GOOGLE_ADS_LOGIN_CUSTOMER_ID,
+        "use_proto_plus": True
+    }
+    return GoogleAdsClient.load_from_dict(credentials, version="v16")  # Keeping version v16
+
+def google_ads_script():
+    # Get the last written date from Google Sheets
+    last_written_date = get_last_written_date("Curist_Google_NOT_amz")
+    
+    if last_written_date:
+        # No need to call .date() on last_written_date, it's already a date object
+        start_date = last_written_date - timedelta(days=1)  # Fetch last 2 days of data
+    else:
+        start_date = datetime(datetime.now().year, 1, 1).date()  # Fetch YTD data if no previous entry
+    
+    end_date = datetime.now().date()  # Ensure this is a date object
+
+    try:
+        # Fetch Google Ads data for the specified date range
+        daily_data = fetch_google_ads_data(GOOGLE_ADS_CUSTOMER_ID, start_date, end_date)
+
+        # Fill in missing dates with zero values
+        daily_data = fill_missing_dates_with_zeros(daily_data, start_date, end_date)
+
+        if daily_data:
+            # Write the aggregated data to Google Sheets
+            write_google_ads_data_to_gs(daily_data, "Curist_Google_NOT_amz")
+    except Exception as e:
+        logger.error(f"Error encountered for {start_date}: {str(e)}")
+
+
+
+def fill_missing_dates_with_zeros(daily_data, start_date, end_date):
+    current_date = start_date
+
+    # Loop over each date in the range and ensure it exists in daily_data
+    while current_date <= end_date:
+        date_str = current_date.strftime('%Y-%m-%d')
+        if date_str not in daily_data:
+            # If date doesn't exist, initialize with zeros
+            daily_data[date_str] = {
+                "cost": 0,
+                "conversions_value": 0,
+                "clicks": 0,
+                "purchases": 0,
+                "impressions": 0
+            }
+        current_date += timedelta(days=1)
+
+    return daily_data
+
+# Fetch Google Ads data for the given date range
+def fetch_google_ads_data(customer_id, start_date, end_date, retries=0):
+    googleads_client = get_google_ads_client()
+    start_date_str = start_date.strftime('%Y-%m-%d')
+    end_date_str = end_date.strftime('%Y-%m-%d')
+
+
+    query = f"""
+        SELECT
+            segments.date,
+            campaign.name,
+            metrics.cost_micros,
+            metrics.conversions_value,
+            metrics.clicks,
+            metrics.conversions,  -- Purchases
+            metrics.impressions   -- Impressions for CTR calculation
+        FROM
+            campaign
+        WHERE
+            segments.date BETWEEN '{start_date_str}' AND '{end_date_str}'
+            AND campaign.name NOT LIKE '%AMZ%' -- Exclude campaigns containing 'AMZ'
+        ORDER BY
+            segments.date ASC
+    """
+
+
+    logger.info(f"Sending query: {query}")
+
+    service = googleads_client.get_service("GoogleAdsService", version="v16")
+    
+    # Initialize an empty dictionary for storing daily data
+    daily_data = {}
+
+    try:
+        response = service.search_stream(customer_id=customer_id, query=query)
+
+        # Process the response
+        for batch in response:
+            for row in batch.results:
+                date_str = row.segments.date
+
+                # Initialize the date entry if it doesn't exist
+                if date_str not in daily_data:
+                    daily_data[date_str] = {
+                        "cost": 0,                # Cost (in USD)
+                        "conversions_value": 0,    # Revenue (in USD)
+                        "clicks": 0,               # Clicks
+                        "purchases": 0,            # Purchases (conversions)
+                        "impressions": 0           # Impressions (for CTR calculation)
+                    }
+
+                # Safely handle the metrics and convert where necessary
+                cost_usd = row.metrics.cost_micros / 1_000_000 if row.metrics.cost_micros else 0  # Cost is in USD (from micros)
+                conversions_value = row.metrics.conversions_value or 0  # Revenue is in USD
+                clicks = row.metrics.clicks or 0  # Clicks
+                purchases = row.metrics.conversions or 0  # Purchases (conversions)
+                impressions = row.metrics.impressions or 0  # Impressions
+
+                # Update the daily data for the given date
+                daily_data[date_str]["cost"] += cost_usd
+                daily_data[date_str]["conversions_value"] += conversions_value
+                daily_data[date_str]["clicks"] += clicks
+                daily_data[date_str]["purchases"] += purchases
+                daily_data[date_str]["impressions"] += impressions
+
+        return daily_data
+
+    except Exception as e:
+        if '429' in str(e) and retries < MAX_RETRIES:
+            wait_time = RETRY_BACKOFF_FACTOR ** retries
+            logger.warning(f"429 Error encountered, retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+            return fetch_google_ads_data(customer_id, start_date, end_date, retries + 1)
+        else:
+            logger.error(f"Error encountered: {str(e)}")
+            return {}
+
+def write_google_ads_data_to_gs(aggregated_data, sheet_name: str = "Curist_Google_NOT_amz"):
+    HEADER = ["Date", "Cost (USD)", "Revenue (USD)", "Clicks", "Purchases", "CTR (%)", "CPC (USD)", "ROAS"]
+
+    try:
+        gc = authenticate_gsheets()
+        sh = gc.open("Curist // Global ROAS")
+        worksheet = sh.worksheet(sheet_name)
+
+        # Fetch existing data to determine the current state of the sheet
+        data = worksheet.get_all_values()
+        
+        # Insert headers if not already present
+        if not data or data[0] != HEADER:
+            worksheet.insert_row(HEADER, 1)
+
+        # Collect existing dates in the sheet
+        dates_in_sheet = {row[0]: idx + 2 for idx, row in enumerate(data[1:])}
+
+        rows_to_append = []
+        rows_to_update = []
+
+        # Sort the aggregated data by date
+        sorted_dates = sorted(aggregated_data.keys())
+
+        for date_str in sorted_dates:
+            metrics = aggregated_data[date_str]
+            # Ensure metrics have values, even if they are zero
+            cost = metrics.get("cost", 0)
+            revenue = metrics.get("conversions_value", 0)
+            clicks = metrics.get("clicks", 0)
+            purchases = round(metrics.get("purchases", 0), 2)
+            impressions = metrics.get("impressions", 0)
+
+            # Calculate CTR, CPC, and ROAS
+            ctr = (clicks / impressions * 100) if impressions > 0 else 0
+            cpc = (cost / clicks) if clicks > 0 else 0
+            roas = (revenue / cost) if cost > 0 else 0
+
+            # Format the values for writing into the sheet
+            cost_formatted = f"${cost:.2f}"
+            revenue_formatted = f"${revenue:.2f}"
+            ctr_formatted = f"{ctr:.2f}%"
+            cpc_formatted = f"${cpc:.2f}"
+            roas_formatted = f"{roas:.2f}"
+
+            # Prepare the row to write to the sheet
+            row_data = [date_str, cost_formatted, revenue_formatted, clicks, purchases, ctr_formatted, cpc_formatted, roas_formatted]
+
+            if date_str in dates_in_sheet:
+                row_index = dates_in_sheet[date_str]
+                rows_to_update.append((row_index, row_data))
+            else:
+                rows_to_append.append(row_data)
+
+        # Batch update existing rows
+        for row_index, row_data in rows_to_update:
+            worksheet.update(f'A{row_index}:H{row_index}', [row_data])
+            time.sleep(1)  # Adding a small delay between updates to prevent hitting rate limits.
+
+        # Append new rows in a single batch if there are any, after sorting by date
+        if rows_to_append:
+            worksheet.append_rows(rows_to_append)
+
+    except Exception as e:
+        logger.error(f"Error writing to Google Sheets: {str(e)}")
+
+
+# Get the last date written to Google Sheets
+def get_last_written_date(sheet_name: str = "Curist_Google_NOT_amz"):
+    try:
+        gc = authenticate_gsheets()
+        sh = gc.open("Curist // Global ROAS")
+        worksheet = sh.worksheet(sheet_name)
+        data = worksheet.get_all_values()
+        
+        if len(data) > 1:
+            last_row = data[-1]
+            last_date_str = last_row[0]
+            return datetime.strptime(last_date_str, "%Y-%m-%d").date()  # Ensure we return a date object
+        return None
+
+    except Exception as e:
+        logger.error(f"Error getting last written date: {str(e)}")
+        return None
+
+
+# Cloud function trigger using Pub/Sub
+@functions_framework.cloud_event
+def hello_pubsub(cloud_event):
+    google_ads_script()
