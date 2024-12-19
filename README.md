@@ -5,6 +5,7 @@ This project automates fetching Google Ads data using the Google Ads API and wri
 
 It's very easy to use. You dont need to use paid applications for creating your automted reports. You can easily customize your report, create visualizations. 
 
+Feel free to contact me for any questions.
 ## Features
 - Fetches daily data from Google Ads 
 - Excludes specific campaigns 
